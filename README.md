@@ -64,7 +64,8 @@ The fork policy is simple:
 
 - `main` should stay as close to `upstream/main` as possible
 - fork-specific housekeeping on `main` must stay small and documented here
-- candidate product or bugfix deltas should live on short-lived branches until they are accepted upstream
+- candidate product or bugfix deltas should live on short-lived branches until they are either merged into this fork or dropped
+- upstream is treated as a vendor source, not as an expected code-review path for this fork
 
 ### Main branch deltas
 
@@ -74,14 +75,17 @@ These are the only changes we intend to keep on fork `main`:
 | --- | --- |
 | `scripts/sync-upstream.sh` | Fetch `upstream/main`, sync the fork's `main` branch safely, optionally push it, and print the remaining local delta branches. |
 | This README section | Keep a human-readable ledger of fork policy, branch deltas, and upstreaming status. |
+| Disconnect-driven orphaned-thread cleanup in `codex-rs/app-server` | Prevent zero-subscriber threads from staying loaded after unexpected disconnects and reconcile late `ShutdownComplete` bookkeeping. |
 
 ### Active non-main deltas
 
-| Branch | Status | Why it exists |
-| --- | --- | --- |
-| `fix/app-server-orphaned-thread-unload` | Waiting on upstream contributor path | Minimal `codex-rs/app-server` fix for disconnect-driven orphaned thread retention. See [openai/codex#14137](https://github.com/openai/codex/issues/14137) and the [compare view](https://github.com/openai/codex/compare/main...agustif:fix/app-server-orphaned-thread-unload?expand=1). |
+There are currently no fork-owned code deltas intentionally kept off `main`.
 
-If a branch is meant to survive for more than a short review window, it should be listed here. If it is not listed here, treat it as disposable.
+Historical note:
+
+- the orphaned-thread fix was reported upstream in [openai/codex#14137](https://github.com/openai/codex/issues/14137)
+- upstream explicitly said they no longer generally accept external PRs and may not prioritize this bug soon
+- this fork therefore carries that fix on `main` directly
 
 ### Upstream sync workflow
 
