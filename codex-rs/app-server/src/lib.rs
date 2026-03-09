@@ -5,9 +5,13 @@ use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigToml;
+use codex_core::config::find_codex_home;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::config_loader::LoaderOverrides;
+use codex_core::config_loader::load_config_layers_state;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -80,6 +84,7 @@ pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
+const LOG_DB_LEVEL_ENV_VAR: &str = "CODEX_APP_SERVER_LOG_DB_LEVEL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogFormat {
@@ -106,6 +111,7 @@ enum OutboundControlEvent {
         disconnect_sender: Option<CancellationToken>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
+        typed_notifications_only: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     },
     /// Remove state for a closed/disconnected connection.
@@ -321,6 +327,19 @@ fn log_format_from_env() -> LogFormat {
     LogFormat::from_env_value(value.as_deref())
 }
 
+fn log_db_level_from_env() -> Level {
+    let value = std::env::var(LOG_DB_LEVEL_ENV_VAR).ok();
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Level::INFO,
+        Some(raw) if raw.eq_ignore_ascii_case("trace") => Level::TRACE,
+        Some(raw) if raw.eq_ignore_ascii_case("debug") => Level::DEBUG,
+        Some(raw) if raw.eq_ignore_ascii_case("info") => Level::INFO,
+        Some(raw) if raw.eq_ignore_ascii_case("warn") => Level::WARN,
+        Some(raw) if raw.eq_ignore_ascii_case("error") => Level::ERROR,
+        Some(_) => Level::INFO,
+    }
+}
+
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
@@ -389,44 +408,57 @@ pub async fn run_main_with_transport(
             format!("error parsing -c overrides: {e}"),
         )
     })?;
-    let cloud_requirements = match ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides.clone())
-        .loader_overrides(loader_overrides.clone())
-        .build()
+    let cloud_requirements = match (find_codex_home(), AbsolutePathBuf::current_dir()) {
+        (Ok(codex_home), Ok(cwd)) => match load_config_layers_state(
+            &codex_home,
+            Some(cwd),
+            &cli_kv_overrides,
+            loader_overrides.clone(),
+            CloudRequirementsLoader::default(),
+        )
         .await
-    {
-        Ok(config) => {
-            let effective_toml = config.config_layer_stack.effective_config();
-            match effective_toml.try_into() {
-                Ok(config_toml) => {
-                    if let Err(err) = codex_core::personality_migration::maybe_migrate_personality(
-                        &config.codex_home,
-                        &config_toml,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to run personality migration");
+        {
+            Ok(config_layer_stack) => {
+                let effective_toml = config_layer_stack.effective_config();
+                match effective_toml.try_into() {
+                    Ok(config_toml) => {
+                        let config_toml: ConfigToml = config_toml;
+                        if let Err(err) =
+                            codex_core::personality_migration::maybe_migrate_personality(
+                                &codex_home,
+                                &config_toml,
+                            )
+                            .await
+                        {
+                            warn!(error = %err, "Failed to run personality migration");
+                        }
+
+                        let auth_manager = AuthManager::shared(
+                            codex_home.clone(),
+                            false,
+                            config_toml.cli_auth_credentials_store.unwrap_or_default(),
+                        );
+                        cloud_requirements_loader(
+                            auth_manager,
+                            config_toml
+                                .chatgpt_base_url
+                                .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+                            codex_home,
+                        )
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "Failed to deserialize config for personality migration");
+                        CloudRequirementsLoader::default()
                     }
                 }
-                Err(err) => {
-                    warn!(error = %err, "Failed to deserialize config for personality migration");
-                }
             }
-
-            let auth_manager = AuthManager::shared(
-                config.codex_home.clone(),
-                false,
-                config.cli_auth_credentials_store_mode,
-            );
-            cloud_requirements_loader(
-                auth_manager,
-                config.chatgpt_base_url,
-                config.codex_home.clone(),
-            )
-        }
-        Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud requirements");
-            // TODO(gt): Make cloud requirements preload failures blocking once we can fail-closed.
+            Err(err) => {
+                warn!(error = %err, "Failed to preload config for cloud requirements");
+                CloudRequirementsLoader::default()
+            }
+        },
+        (Err(err), _) | (_, Err(err)) => {
+            warn!(error = %err, "Failed to resolve config context for cloud requirements");
             CloudRequirementsLoader::default()
         }
     };
@@ -510,7 +542,7 @@ pub async fn run_main_with_transport(
     .map(log_db::start);
     let log_db_layer = log_db
         .clone()
-        .map(|layer| layer.with_filter(Targets::new().with_default(Level::TRACE)));
+        .map(|layer| layer.with_filter(Targets::new().with_default(log_db_level_from_env())));
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
 
@@ -545,6 +577,7 @@ pub async fn run_main_with_transport(
                                 disconnect_sender,
                                 initialized,
                                 experimental_api_enabled,
+                                typed_notifications_only,
                                 opted_out_notification_methods,
                             } => {
                                 outbound_connections.insert(
@@ -553,6 +586,7 @@ pub async fn run_main_with_transport(
                                         writer,
                                         initialized,
                                         experimental_api_enabled,
+                                        typed_notifications_only,
                                         opted_out_notification_methods,
                                         disconnect_sender,
                                     ),
@@ -656,6 +690,8 @@ pub async fn run_main_with_transport(
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
                                 let outbound_experimental_api_enabled =
                                     Arc::new(AtomicBool::new(false));
+                                let outbound_typed_notifications_only =
+                                    Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods =
                                     Arc::new(RwLock::new(HashSet::new()));
                                 if outbound_control_tx
@@ -666,6 +702,9 @@ pub async fn run_main_with_transport(
                                         initialized: Arc::clone(&outbound_initialized),
                                         experimental_api_enabled: Arc::clone(
                                             &outbound_experimental_api_enabled,
+                                        ),
+                                        typed_notifications_only: Arc::clone(
+                                            &outbound_typed_notifications_only,
                                         ),
                                         opted_out_notification_methods: Arc::clone(
                                             &outbound_opted_out_notification_methods,
@@ -681,6 +720,7 @@ pub async fn run_main_with_transport(
                                     ConnectionState::new(
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
+                                        outbound_typed_notifications_only,
                                         outbound_opted_out_notification_methods,
                                     ),
                                 );
@@ -734,6 +774,12 @@ pub async fn run_main_with_transport(
                                             .outbound_experimental_api_enabled
                                             .store(
                                                 connection_state.session.experimental_api_enabled,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                        connection_state
+                                            .outbound_typed_notifications_only
+                                            .store(
+                                                connection_state.session.typed_notifications_only,
                                                 std::sync::atomic::Ordering::Release,
                                             );
                                         if !was_initialized && connection_state.session.initialized {
@@ -831,8 +877,11 @@ pub async fn run_main_with_transport(
 
 #[cfg(test)]
 mod tests {
+    use super::LOG_DB_LEVEL_ENV_VAR;
     use super::LogFormat;
+    use super::log_db_level_from_env;
     use pretty_assertions::assert_eq;
+    use tracing::Level;
 
     #[test]
     fn log_format_from_env_value_matches_json_values_case_insensitively() {
@@ -847,5 +896,43 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[test]
+    fn log_db_level_from_env_defaults_to_info() {
+        unsafe {
+            std::env::remove_var(LOG_DB_LEVEL_ENV_VAR);
+        }
+        assert_eq!(log_db_level_from_env(), Level::INFO);
+    }
+
+    #[test]
+    fn log_db_level_from_env_parses_known_values_case_insensitively() {
+        unsafe {
+            std::env::set_var(LOG_DB_LEVEL_ENV_VAR, "trace");
+        }
+        assert_eq!(log_db_level_from_env(), Level::TRACE);
+        unsafe {
+            std::env::set_var(LOG_DB_LEVEL_ENV_VAR, "DEBUG");
+        }
+        assert_eq!(log_db_level_from_env(), Level::DEBUG);
+        unsafe {
+            std::env::set_var(LOG_DB_LEVEL_ENV_VAR, " Warn ");
+        }
+        assert_eq!(log_db_level_from_env(), Level::WARN);
+        unsafe {
+            std::env::remove_var(LOG_DB_LEVEL_ENV_VAR);
+        }
+    }
+
+    #[test]
+    fn log_db_level_from_env_falls_back_to_info_for_invalid_values() {
+        unsafe {
+            std::env::set_var(LOG_DB_LEVEL_ENV_VAR, "loud");
+        }
+        assert_eq!(log_db_level_from_env(), Level::INFO);
+        unsafe {
+            std::env::remove_var(LOG_DB_LEVEL_ENV_VAR);
+        }
     }
 }

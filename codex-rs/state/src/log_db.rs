@@ -126,6 +126,9 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if self.sender.capacity() == 0 {
+            return;
+        }
         let metadata = event.metadata();
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);

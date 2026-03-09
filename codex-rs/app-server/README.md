@@ -73,6 +73,11 @@ Clients must send a single `initialize` request per transport connection before 
 
 `initialize.params.capabilities` also supports per-connection notification opt-out via `optOutNotificationMethods`, which is a list of exact method names to suppress for that connection. Matching is exact (no wildcards/prefixes). Unknown method names are accepted and ignored.
 
+Clients that only want typed app-server notifications can also set
+`initialize.params.capabilities.typedNotificationsOnly = true`. When enabled, the server suppresses
+legacy `codex/event/*` notifications for that connection while continuing to send typed v2
+notifications such as `thread/*`, `turn/*`, and `item/*`.
+
 Applications building on top of `codex app-server` should identify themselves via the `clientInfo` parameter.
 
 **Important**: `clientInfo.name` is used to identify the client for the OpenAI Compliance Logs Platform. If
@@ -713,6 +718,9 @@ Thread realtime uses a separate thread-scoped notification surface. `thread/real
 ### Notification opt-out
 
 Clients can suppress specific notifications per connection by sending exact method names in `initialize.params.capabilities.optOutNotificationMethods`.
+
+Clients can also set `initialize.params.capabilities.typedNotificationsOnly = true` to suppress all
+legacy `codex/event/*` notifications for that connection without listing them individually.
 
 - Exact-match only: `item/agentMessage/delta` suppresses only that method.
 - Unknown method names are ignored.

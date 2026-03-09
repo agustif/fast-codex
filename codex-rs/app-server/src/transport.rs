@@ -146,6 +146,7 @@ pub(crate) enum TransportEvent {
 pub(crate) struct ConnectionState {
     pub(crate) outbound_initialized: Arc<AtomicBool>,
     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
+    pub(crate) outbound_typed_notifications_only: Arc<AtomicBool>,
     pub(crate) outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     pub(crate) session: ConnectionSessionState,
 }
@@ -154,11 +155,13 @@ impl ConnectionState {
     pub(crate) fn new(
         outbound_initialized: Arc<AtomicBool>,
         outbound_experimental_api_enabled: Arc<AtomicBool>,
+        outbound_typed_notifications_only: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
             outbound_initialized,
             outbound_experimental_api_enabled,
+            outbound_typed_notifications_only,
             outbound_opted_out_notification_methods,
             session: ConnectionSessionState::default(),
         }
@@ -168,6 +171,7 @@ impl ConnectionState {
 pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
+    pub(crate) typed_notifications_only: Arc<AtomicBool>,
     pub(crate) opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     pub(crate) writer: mpsc::Sender<OutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
@@ -178,12 +182,14 @@ impl OutboundConnectionState {
         writer: mpsc::Sender<OutgoingMessage>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
+        typed_notifications_only: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
         disconnect_sender: Option<CancellationToken>,
     ) -> Self {
         Self {
             initialized,
             experimental_api_enabled,
+            typed_notifications_only,
             opted_out_notification_methods,
             writer,
             disconnect_sender,
@@ -558,6 +564,13 @@ fn should_skip_notification_for_connection(
             opted_out_notification_methods.contains(method.as_str())
         }
         OutgoingMessage::Notification(notification) => {
+            if connection_state
+                .typed_notifications_only
+                .load(Ordering::Acquire)
+                && notification.method.starts_with("codex/event/")
+            {
+                return true;
+            }
             opted_out_notification_methods.contains(notification.method.as_str())
         }
         _ => false,
@@ -922,6 +935,7 @@ mod tests {
                 writer_tx,
                 initialized,
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 opted_out_notification_methods,
                 None,
             ),
@@ -948,6 +962,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_notifications_only_suppresses_legacy_notifications_only() {
+        let connection_id = ConnectionId(70);
+        let (writer_tx, mut writer_rx) = mpsc::channel(2);
+
+        let mut connections = HashMap::new();
+        connections.insert(
+            connection_id,
+            OutboundConnectionState::new(
+                writer_tx,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(RwLock::new(HashSet::new())),
+                None,
+            ),
+        );
+
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::Notification(
+                    crate::outgoing_message::OutgoingNotification {
+                        method: "codex/event/task_started".to_string(),
+                        params: None,
+                    },
+                ),
+            },
+        )
+        .await;
+
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "legacy notification should be dropped when typed_notifications_only is enabled"
+        );
+
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(
+                    codex_app_server_protocol::ServerNotification::ThreadClosed(
+                        codex_app_server_protocol::ThreadClosedNotification {
+                            thread_id: "thread-1".to_string(),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+        let message = writer_rx
+            .recv()
+            .await
+            .expect("typed notification should still be delivered");
+        assert!(matches!(
+            message,
+            OutgoingMessage::AppServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadClosed(_)
+            )
+        ));
+    }
+
+    #[tokio::test]
     async fn command_execution_request_approval_strips_experimental_fields_without_capability() {
         let connection_id = ConnectionId(8);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
@@ -958,6 +1036,7 @@ mod tests {
             OutboundConnectionState::new(
                 writer_tx,
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
                 None,
@@ -1025,6 +1104,7 @@ mod tests {
                 writer_tx,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
                 None,
             ),
@@ -1112,6 +1192,7 @@ mod tests {
                 fast_writer_tx,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
                 Some(fast_disconnect_token.clone()),
             ),
@@ -1122,6 +1203,7 @@ mod tests {
                 slow_writer_tx.clone(),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
                 Some(slow_disconnect_token.clone()),
             ),
@@ -1199,6 +1281,7 @@ mod tests {
                 writer_tx,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
                 None,
             ),

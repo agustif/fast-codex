@@ -91,6 +91,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::ForkedHistorySnapshot;
+use codex_protocol::protocol::ForkedSnapshotTurnSettings;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -457,7 +459,9 @@ impl Codex {
         let persisted_tools = if dynamic_tools.is_empty() {
             let thread_id = match &conversation_history {
                 InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
-                InitialHistory::Forked(_) => conversation_history.forked_from_id(),
+                InitialHistory::Forked(_) | InitialHistory::ForkedSnapshot(_) => {
+                    conversation_history.forked_from_id()
+                }
                 InitialHistory::New => None,
             };
             match thread_id {
@@ -1235,7 +1239,7 @@ impl Session {
         let forked_from_id = initial_history.forked_from_id();
 
         let (conversation_id, rollout_params) = match &initial_history {
-            InitialHistory::New | InitialHistory::Forked(_) => {
+            InitialHistory::New | InitialHistory::Forked(_) | InitialHistory::ForkedSnapshot(_) => {
                 let conversation_id = ThreadId::default();
                 (
                     conversation_id,
@@ -1272,7 +1276,9 @@ impl Session {
                 resumed.history.as_slice(),
                 resumed.rollout_path.as_path(),
             ),
-            InitialHistory::New | InitialHistory::Forked(_) => None,
+            InitialHistory::New | InitialHistory::Forked(_) | InitialHistory::ForkedSnapshot(_) => {
+                None
+            }
         };
 
         // Kick off independent async setup tasks in parallel to reduce startup latency.
@@ -1841,6 +1847,35 @@ impl Session {
         state.clear_connector_selection();
     }
 
+    pub(crate) async fn build_forked_history_snapshot(
+        &self,
+        forked_from_id: ThreadId,
+        injected_items: Vec<ResponseItem>,
+    ) -> ForkedHistorySnapshot {
+        let state = self.state.lock().await;
+        let mut history = state.clone_history().raw_items().to_vec();
+        history.extend(injected_items);
+        ForkedHistorySnapshot {
+            forked_from_id,
+            cwd: state.session_configuration.cwd.clone(),
+            base_instructions: Some(BaseInstructions {
+                text: state.session_configuration.base_instructions.clone(),
+            }),
+            dynamic_tools: (!state.session_configuration.dynamic_tools.is_empty())
+                .then_some(state.session_configuration.dynamic_tools.clone()),
+            history,
+            previous_turn_settings: state.previous_turn_settings().map(|settings| {
+                ForkedSnapshotTurnSettings {
+                    model: settings.model,
+                    realtime_active: settings.realtime_active,
+                }
+            }),
+            reference_context_item: state.reference_context_item(),
+            token_info: state.token_info(),
+            mcp_tool_selection: state.get_mcp_tool_selection(),
+        }
+    }
+
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
         self.clear_mcp_tool_selection().await;
@@ -1981,6 +2016,47 @@ impl Session {
                 self.ensure_rollout_materialized().await;
 
                 // Flush after seeding history and any persisted rollout copy.
+                if !is_subagent {
+                    self.flush_rollout().await;
+                }
+            }
+            InitialHistory::ForkedSnapshot(snapshot) => {
+                self.set_previous_turn_settings(snapshot.previous_turn_settings.map(|settings| {
+                    PreviousTurnSettings {
+                        model: settings.model,
+                        realtime_active: settings.realtime_active,
+                    }
+                }))
+                .await;
+                {
+                    let mut state = self.state.lock().await;
+                    state.set_reference_context_item(snapshot.reference_context_item.clone());
+                }
+
+                if !snapshot.history.is_empty() {
+                    self.record_into_history(&snapshot.history, &turn_context)
+                        .await;
+                    self.persist_rollout_response_items(&snapshot.history).await;
+                }
+
+                if let Some(info) = snapshot.token_info {
+                    let mut state = self.state.lock().await;
+                    state.set_token_info(Some(info));
+                }
+                if let Some(selected_tools) = snapshot.mcp_tool_selection {
+                    self.set_mcp_tool_selection(selected_tools).await;
+                }
+
+                let initial_context = self.build_initial_context(&turn_context).await;
+                self.record_conversation_items(&turn_context, &initial_context)
+                    .await;
+                {
+                    let mut state = self.state.lock().await;
+                    state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
+                }
+
+                self.ensure_rollout_materialized().await;
+
                 if !is_subagent {
                     self.flush_rollout().await;
                 }

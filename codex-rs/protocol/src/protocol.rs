@@ -1971,10 +1971,55 @@ pub struct ResumedHistory {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ForkedSnapshotTurnSettings {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ForkedHistorySnapshot {
+    pub forked_from_id: ThreadId,
+    pub cwd: PathBuf,
+    pub base_instructions: Option<BaseInstructions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
+    pub history: Vec<ResponseItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_turn_settings: Option<ForkedSnapshotTurnSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_context_item: Option<TurnContextItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_info: Option<TokenUsageInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_selection: Option<Vec<String>>,
+}
+
+impl ForkedHistorySnapshot {
+    pub fn rollout_items(&self) -> Vec<RolloutItem> {
+        let mut items = Vec::new();
+        if let Some(reference_context_item) = &self.reference_context_item {
+            items.push(RolloutItem::TurnContext(reference_context_item.clone()));
+        }
+        if let Some(token_info) = &self.token_info {
+            items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
+                TokenCountEvent {
+                    info: Some(token_info.clone()),
+                    rate_limits: None,
+                },
+            )));
+        }
+        items.extend(self.history.iter().cloned().map(RolloutItem::ResponseItem));
+        items
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub enum InitialHistory {
     New,
     Resumed(ResumedHistory),
     Forked(Vec<RolloutItem>),
+    ForkedSnapshot(ForkedHistorySnapshot),
 }
 
 impl InitialHistory {
@@ -1991,6 +2036,7 @@ impl InitialHistory {
                 RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
                 _ => None,
             }),
+            InitialHistory::ForkedSnapshot(snapshot) => Some(snapshot.forked_from_id),
         }
     }
 
@@ -1999,6 +2045,7 @@ impl InitialHistory {
             InitialHistory::New => None,
             InitialHistory::Resumed(resumed) => session_cwd_from_items(&resumed.history),
             InitialHistory::Forked(items) => session_cwd_from_items(items),
+            InitialHistory::ForkedSnapshot(snapshot) => Some(snapshot.cwd.clone()),
         }
     }
 
@@ -2007,6 +2054,7 @@ impl InitialHistory {
             InitialHistory::New => Vec::new(),
             InitialHistory::Resumed(resumed) => resumed.history.clone(),
             InitialHistory::Forked(items) => items.clone(),
+            InitialHistory::ForkedSnapshot(snapshot) => snapshot.rollout_items(),
         }
     }
 
@@ -2032,6 +2080,16 @@ impl InitialHistory {
                     })
                     .collect(),
             ),
+            InitialHistory::ForkedSnapshot(snapshot) => Some(
+                snapshot
+                    .rollout_items()
+                    .into_iter()
+                    .filter_map(|ri| match ri {
+                        RolloutItem::EventMsg(ev) => Some(ev),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -2049,6 +2107,7 @@ impl InitialHistory {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
                 _ => None,
             }),
+            InitialHistory::ForkedSnapshot(snapshot) => snapshot.base_instructions.clone(),
         }
     }
 
@@ -2065,6 +2124,7 @@ impl InitialHistory {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
                 _ => None,
             }),
+            InitialHistory::ForkedSnapshot(snapshot) => snapshot.dynamic_tools.clone(),
         }
     }
 }

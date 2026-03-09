@@ -30,16 +30,20 @@ use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::TurnStatus as ApiTurnStatus;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
@@ -440,6 +444,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         client_name: "codex-exec".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
+        typed_notifications_only: true,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };
@@ -786,6 +791,29 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 {
                     error_seen = true;
                 }
+                let synthesized = event_from_server_notification(
+                    &notification,
+                    &primary_thread_id_for_requests,
+                    &task_id,
+                );
+                if let Some(event) = synthesized {
+                    match event_processor.process_event(event) {
+                        CodexStatus::Running => {}
+                        CodexStatus::InitiateShutdown => {
+                            if let Err(err) = request_shutdown(
+                                &client,
+                                &mut request_ids,
+                                &primary_thread_id_for_requests,
+                            )
+                            .await
+                            {
+                                warn!("thread/unsubscribe failed during shutdown: {err}");
+                            }
+                            break;
+                        }
+                        CodexStatus::Shutdown => {}
+                    }
+                }
             }
             InProcessServerEvent::LegacyNotification(notification) => {
                 let decoded = match decode_legacy_notification(notification) {
@@ -1046,6 +1074,118 @@ fn normalize_legacy_notification_method(method: &str) -> &str {
 
 fn lagged_event_warning_message(skipped: usize) -> String {
     format!("in-process app-server event stream lagged; dropped {skipped} events")
+}
+
+fn event_from_server_notification(
+    notification: &ServerNotification,
+    primary_thread_id: &str,
+    task_id: &str,
+) -> Option<Event> {
+    match notification {
+        ServerNotification::Error(payload)
+            if payload.thread_id == primary_thread_id && payload.turn_id == task_id =>
+        {
+            let codex_error_info = payload
+                .error
+                .codex_error_info
+                .clone()
+                .map(|info| match info {
+                    codex_app_server_protocol::CodexErrorInfo::ContextWindowExceeded => {
+                        codex_protocol::protocol::CodexErrorInfo::ContextWindowExceeded
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::UsageLimitExceeded => {
+                        codex_protocol::protocol::CodexErrorInfo::UsageLimitExceeded
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::ServerOverloaded => {
+                        codex_protocol::protocol::CodexErrorInfo::ServerOverloaded
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::HttpConnectionFailed {
+                        http_status_code,
+                    } => codex_protocol::protocol::CodexErrorInfo::HttpConnectionFailed {
+                        http_status_code,
+                    },
+                    codex_app_server_protocol::CodexErrorInfo::ResponseStreamConnectionFailed {
+                        http_status_code,
+                    } => codex_protocol::protocol::CodexErrorInfo::ResponseStreamConnectionFailed {
+                        http_status_code,
+                    },
+                    codex_app_server_protocol::CodexErrorInfo::InternalServerError => {
+                        codex_protocol::protocol::CodexErrorInfo::InternalServerError
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::Unauthorized => {
+                        codex_protocol::protocol::CodexErrorInfo::Unauthorized
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::BadRequest => {
+                        codex_protocol::protocol::CodexErrorInfo::BadRequest
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::ThreadRollbackFailed => {
+                        codex_protocol::protocol::CodexErrorInfo::ThreadRollbackFailed
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::SandboxError => {
+                        codex_protocol::protocol::CodexErrorInfo::SandboxError
+                    }
+                    codex_app_server_protocol::CodexErrorInfo::ResponseStreamDisconnected {
+                        http_status_code,
+                    } => codex_protocol::protocol::CodexErrorInfo::ResponseStreamDisconnected {
+                        http_status_code,
+                    },
+                    codex_app_server_protocol::CodexErrorInfo::ResponseTooManyFailedAttempts {
+                        http_status_code,
+                    } => codex_protocol::protocol::CodexErrorInfo::ResponseTooManyFailedAttempts {
+                        http_status_code,
+                    },
+                    codex_app_server_protocol::CodexErrorInfo::Other => {
+                        codex_protocol::protocol::CodexErrorInfo::Other
+                    }
+                });
+            Some(Event {
+                id: String::new(),
+                msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: payload.error.message.clone(),
+                    codex_error_info,
+                }),
+            })
+        }
+        ServerNotification::TurnStarted(TurnStartedNotification { thread_id, turn })
+            if thread_id == primary_thread_id && turn.id == task_id =>
+        {
+            Some(Event {
+                id: String::new(),
+                msg: EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: turn.id.clone(),
+                    model_context_window: None,
+                    collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
+                }),
+            })
+        }
+        ServerNotification::TurnCompleted(TurnCompletedNotification { thread_id, turn })
+            if thread_id == primary_thread_id && turn.id == task_id =>
+        {
+            match turn.status {
+                ApiTurnStatus::Interrupted => Some(Event {
+                    id: String::new(),
+                    msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                        reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                        turn_id: Some(turn.id.clone()),
+                    }),
+                }),
+                _ => {
+                    let last_agent_message = turn.items.iter().rev().find_map(|item| match item {
+                        ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+                        _ => None,
+                    });
+                    Some(Event {
+                        id: String::new(),
+                        msg: EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+                            turn_id: turn.id.clone(),
+                            last_agent_message,
+                        }),
+                    })
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 struct DecodedLegacyNotification {
@@ -1806,5 +1946,78 @@ mod tests {
                 meta: None,
             }
         );
+    }
+
+    #[test]
+    fn event_from_server_notification_maps_turn_completed_to_legacy_turn_complete() {
+        let notification = ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: codex_app_server_protocol::Turn {
+                id: "turn-1".to_string(),
+                items: vec![ThreadItem::AgentMessage {
+                    id: "item-1".to_string(),
+                    text: "done".to_string(),
+                    phase: None,
+                }],
+                error: None,
+                status: ApiTurnStatus::Completed,
+            },
+        });
+
+        let event = event_from_server_notification(&notification, "thread-1", "turn-1")
+            .expect("turn completed should map to legacy event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+                turn_id,
+                last_agent_message,
+            }) if turn_id == "turn-1" && last_agent_message.as_deref() == Some("done")
+        ));
+    }
+
+    #[test]
+    fn event_from_server_notification_maps_interrupted_completion_to_turn_aborted() {
+        let notification = ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: codex_app_server_protocol::Turn {
+                id: "turn-1".to_string(),
+                items: vec![],
+                error: None,
+                status: ApiTurnStatus::Interrupted,
+            },
+        });
+
+        let event = event_from_server_notification(&notification, "thread-1", "turn-1")
+            .expect("interrupted turn should map to turn aborted");
+        assert!(matches!(
+            event.msg,
+            EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                turn_id,
+            }) if turn_id.as_deref() == Some("turn-1")
+        ));
+    }
+
+    #[test]
+    fn event_from_server_notification_maps_error_notification_to_legacy_error() {
+        let notification =
+            ServerNotification::Error(codex_app_server_protocol::ErrorNotification {
+                error: codex_app_server_protocol::TurnError {
+                    message: "boom".to_string(),
+                    codex_error_info: None,
+                    additional_details: None,
+                },
+                will_retry: false,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            });
+
+        let event = event_from_server_notification(&notification, "thread-1", "turn-1")
+            .expect("error notification should map to legacy error");
+        assert!(matches!(
+            event.msg,
+            EventMsg::Error(codex_protocol::protocol::ErrorEvent { message, .. })
+                if message == "boom"
+        ));
     }
 }

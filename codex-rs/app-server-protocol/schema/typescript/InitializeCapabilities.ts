@@ -11,6 +11,11 @@ export type InitializeCapabilities = {
  */
 experimentalApi: boolean, 
 /**
+ * When true, suppress legacy `codex/event/*` notifications and rely on
+ * typed app-server notifications only.
+ */
+typedNotificationsOnly: boolean, 
+/**
  * Exact notification method names that should be suppressed for this
  * connection (for example `codex/event/session_configured`).
  */

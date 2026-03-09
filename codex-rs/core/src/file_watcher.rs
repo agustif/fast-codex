@@ -86,7 +86,8 @@ impl ThrottledPaths {
 }
 
 pub(crate) struct FileWatcher {
-    inner: Option<Mutex<FileWatcherInner>>,
+    inner: Mutex<Option<FileWatcherInner>>,
+    enabled: bool,
     state: Arc<RwLock<WatchState>>,
     tx: broadcast::Sender<FileWatcherEvent>,
 }
@@ -106,32 +107,23 @@ impl Drop for WatchRegistration {
 
 impl FileWatcher {
     pub(crate) fn new(_codex_home: PathBuf) -> notify::Result<Self> {
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
-        let raw_tx_clone = raw_tx;
-        let watcher = notify::recommended_watcher(move |res| {
-            let _ = raw_tx_clone.send(res);
-        })?;
-        let inner = FileWatcherInner {
-            watcher,
-            watched_paths: HashMap::new(),
-        };
         let (tx, _) = broadcast::channel(128);
         let state = Arc::new(RwLock::new(WatchState {
             skills_root_ref_counts: HashMap::new(),
         }));
-        let file_watcher = Self {
-            inner: Some(Mutex::new(inner)),
+        Ok(Self {
+            inner: Mutex::new(None),
+            enabled: true,
             state: Arc::clone(&state),
-            tx: tx.clone(),
-        };
-        file_watcher.spawn_event_loop(raw_rx, state, tx);
-        Ok(file_watcher)
+            tx,
+        })
     }
 
     pub(crate) fn noop() -> Self {
         let (tx, _) = broadcast::channel(1);
         Self {
-            inner: None,
+            inner: Mutex::new(None),
+            enabled: false,
             state: Arc::new(RwLock::new(WatchState {
                 skills_root_ref_counts: HashMap::new(),
             })),
@@ -241,12 +233,42 @@ impl FileWatcher {
         }
     }
 
+    fn ensure_inner(&self) -> Option<std::sync::MutexGuard<'_, Option<FileWatcherInner>>> {
+        if !self.enabled {
+            return None;
+        }
+
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+            let raw_tx_clone = raw_tx;
+            let watcher = match notify::recommended_watcher(move |res| {
+                let _ = raw_tx_clone.send(res);
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    warn!("failed to initialize file watcher: {err}");
+                    return None;
+                }
+            };
+            *guard = Some(FileWatcherInner {
+                watcher,
+                watched_paths: HashMap::new(),
+            });
+            self.spawn_event_loop(raw_rx, Arc::clone(&self.state), self.tx.clone());
+        }
+        Some(guard)
+    }
+
     fn unregister_roots(&self, roots: &[PathBuf]) {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
+        let mut inner_guard: Option<std::sync::MutexGuard<'_, Option<FileWatcherInner>>> = None;
 
         for root in roots {
             let mut should_unwatch = false;
@@ -262,17 +284,11 @@ impl FileWatcher {
             if !should_unwatch {
                 continue;
             }
-            let Some(inner) = &self.inner else {
-                continue;
-            };
             if inner_guard.is_none() {
-                let guard = inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                inner_guard = Some(guard);
+                inner_guard = self.ensure_inner();
             }
 
-            let Some(guard) = inner_guard.as_mut() else {
+            let Some(guard) = inner_guard.as_mut().and_then(|guard| guard.as_mut()) else {
                 continue;
             };
             if guard.watched_paths.remove(root).is_none() {
@@ -285,16 +301,16 @@ impl FileWatcher {
     }
 
     fn watch_path(&self, path: PathBuf, mode: RecursiveMode) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
         if !path.exists() {
             return;
         }
         let watch_path = path;
-        let mut guard = inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut guard) = self.ensure_inner() else {
+            return;
+        };
+        let Some(guard) = guard.as_mut() else {
+            return;
+        };
         if let Some(existing) = guard.watched_paths.get(&watch_path) {
             if *existing == RecursiveMode::Recursive || *existing == mode {
                 return;
@@ -505,10 +521,17 @@ mod tests {
         std::fs::create_dir(&root).expect("create root");
 
         let watcher = Arc::new(FileWatcher::new(temp_dir.path().to_path_buf()).expect("watcher"));
+        assert!(
+            watcher.inner.lock().expect("watcher inner").is_none(),
+            "watcher should initialize lazily"
+        );
         watcher.register_skills_root(root.clone());
 
-        let inner = watcher.inner.as_ref().expect("watcher inner");
-        let inner_guard = inner.lock().expect("inner lock");
+        let inner_guard = watcher.inner.lock().expect("inner lock");
+        assert!(
+            inner_guard.is_some(),
+            "watcher inner should be initialized after first registration"
+        );
 
         let unregister_watcher = Arc::clone(&watcher);
         let unregister_root = root.clone();
@@ -540,8 +563,8 @@ mod tests {
         assert_eq!(state.skills_root_ref_counts.get(&root), Some(&1));
         drop(state);
 
-        let inner = watcher.inner.as_ref().expect("watcher inner");
-        let inner = inner.lock().expect("inner lock");
+        let inner = watcher.inner.lock().expect("inner lock");
+        let inner = inner.as_ref().expect("watcher inner");
         assert_eq!(
             inner.watched_paths.get(&root),
             Some(&RecursiveMode::Recursive)

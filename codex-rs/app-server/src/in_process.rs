@@ -374,6 +374,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
         let (writer_tx, mut writer_rx) = mpsc::channel::<OutgoingMessage>(channel_capacity);
         let outbound_initialized = Arc::new(AtomicBool::new(false));
         let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
+        let outbound_typed_notifications_only = Arc::new(AtomicBool::new(false));
         let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
 
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
@@ -383,6 +384,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                 writer_tx,
                 Arc::clone(&outbound_initialized),
                 Arc::clone(&outbound_experimental_api_enabled),
+                Arc::clone(&outbound_typed_notifications_only),
                 Arc::clone(&outbound_opted_out_notification_methods),
                 None,
             ),
@@ -437,6 +439,10 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                                 }
                                 outbound_experimental_api_enabled.store(
                                     session.experimental_api_enabled,
+                                    Ordering::Release,
+                                );
+                                outbound_typed_notifications_only.store(
+                                    session.typed_notifications_only,
                                     Ordering::Release,
                                 );
                                 if !was_initialized && session.initialized {

@@ -143,6 +143,7 @@ pub(crate) struct MessageProcessor {
 pub(crate) struct ConnectionSessionState {
     pub(crate) initialized: bool,
     pub(crate) experimental_api_enabled: bool,
+    pub(crate) typed_notifications_only: bool,
     pub(crate) opted_out_notification_methods: HashSet<String>,
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) client_version: Option<String>,
@@ -444,17 +445,29 @@ impl MessageProcessor {
                 // shared thread when another connected client did not opt into
                 // experimental API). Proposed direction is instance-global first-write-wins
                 // with initialize-time mismatch rejection.
-                let (experimental_api_enabled, opt_out_notification_methods) =
-                    match params.capabilities {
-                        Some(capabilities) => (
-                            capabilities.experimental_api,
-                            capabilities
-                                .opt_out_notification_methods
-                                .unwrap_or_default(),
-                        ),
-                        None => (false, Vec::new()),
-                    };
+                let (
+                    experimental_api_enabled,
+                    typed_notifications_only,
+                    mut opt_out_notification_methods,
+                ) = match params.capabilities {
+                    Some(capabilities) => (
+                        capabilities.experimental_api,
+                        capabilities.typed_notifications_only,
+                        capabilities
+                            .opt_out_notification_methods
+                            .unwrap_or_default(),
+                    ),
+                    None => (false, false, Vec::new()),
+                };
+                if typed_notifications_only {
+                    opt_out_notification_methods.push("codex/event/task_started".to_string());
+                    opt_out_notification_methods.push("codex/event/task_complete".to_string());
+                    opt_out_notification_methods.push("codex/event/turn_aborted".to_string());
+                    opt_out_notification_methods.push("codex/event/shutdown_complete".to_string());
+                    opt_out_notification_methods.push("codex/event/session_configured".to_string());
+                }
                 session.experimental_api_enabled = experimental_api_enabled;
+                session.typed_notifications_only = typed_notifications_only;
                 session.opted_out_notification_methods =
                     opt_out_notification_methods.into_iter().collect();
                 let ClientInfo {

@@ -53,6 +53,10 @@ pub struct InitializeCapabilities {
     /// Opt into receiving experimental API methods and fields.
     #[serde(default)]
     pub experimental_api: bool,
+    /// When true, suppress legacy `codex/event/*` notifications and rely on
+    /// typed app-server notifications only.
+    #[serde(default)]
+    pub typed_notifications_only: bool,
     /// Exact notification method names that should be suppressed for this
     /// connection (for example `codex/event/session_configured`).
     #[ts(optional = nullable)]
