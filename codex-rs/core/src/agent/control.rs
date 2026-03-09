@@ -165,21 +165,37 @@ impl AgentControl {
                                 "parent thread rollout unavailable for fork: {parent_thread_id}"
                             ))
                         })?;
-                    let mut forked_rollout_items =
-                        RolloutRecorder::get_rollout_history(&rollout_path)
-                            .await?
-                            .get_rollout_items();
                     let mut output = FunctionCallOutputPayload::from_text(
                         FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string(),
                     );
                     output.success = Some(true);
-                    forked_rollout_items.push(RolloutItem::ResponseItem(
-                        ResponseItem::FunctionCallOutput {
-                            call_id: call_id.clone(),
-                            output,
-                        },
-                    ));
-                    let initial_history = InitialHistory::Forked(forked_rollout_items);
+                    let initial_history = if let Some(parent_thread) = parent_thread.as_ref() {
+                        InitialHistory::ForkedSnapshot(
+                            parent_thread
+                                .codex
+                                .session
+                                .build_forked_history_snapshot(
+                                    parent_thread_id,
+                                    vec![ResponseItem::FunctionCallOutput {
+                                        call_id: call_id.clone(),
+                                        output,
+                                    }],
+                                )
+                                .await,
+                        )
+                    } else {
+                        let mut forked_rollout_items =
+                            RolloutRecorder::get_rollout_history(&rollout_path)
+                                .await?
+                                .get_rollout_items();
+                        forked_rollout_items.push(RolloutItem::ResponseItem(
+                            ResponseItem::FunctionCallOutput {
+                                call_id: call_id.clone(),
+                                output,
+                            },
+                        ));
+                        InitialHistory::Forked(forked_rollout_items)
+                    };
                     state
                         .fork_thread_with_source(
                             config,

@@ -3554,6 +3554,16 @@ impl CodexMessageProcessor {
                 thread.preview = preview_from_rollout_items(items);
                 Ok(thread)
             }
+            InitialHistory::ForkedSnapshot(snapshot) => {
+                let config_snapshot = thread.config_snapshot().await;
+                let mut thread = build_thread_from_snapshot(
+                    thread_id,
+                    &config_snapshot,
+                    Some(rollout_path.into()),
+                );
+                thread.preview = preview_from_rollout_items(&snapshot.rollout_items());
+                Ok(thread)
+            }
             InitialHistory::New => Err(format!(
                 "failed to build resume response for thread {thread_id}: initial history missing"
             )),
@@ -6291,35 +6301,6 @@ impl CodexMessageProcessor {
                             }
                         };
 
-                        // For now, we send a notification for every event,
-                        // JSON-serializing the `Event` as-is, but these should
-                        // be migrated to be variants of `ServerNotification`
-                        // instead.
-                        let event_formatted = match &event.msg {
-                            EventMsg::TurnStarted(_) => "task_started",
-                            EventMsg::TurnComplete(_) => "task_complete",
-                            _ => &event.msg.to_string(),
-                        };
-                        let request_event_name = format!("codex/event/{event_formatted}");
-                        tracing::trace!(
-                            conversation_id = %conversation_id,
-                            "app-server event: {request_event_name}"
-                        );
-                        let mut params = match serde_json::to_value(event.clone()) {
-                            Ok(serde_json::Value::Object(map)) => map,
-                            Ok(_) => {
-                                error!("event did not serialize to an object");
-                                continue;
-                            }
-                            Err(err) => {
-                                error!("failed to serialize event: {err}");
-                                continue;
-                            }
-                        };
-                        params.insert(
-                            "conversationId".to_string(),
-                            conversation_id.to_string().into(),
-                        );
                         let raw_events_enabled = {
                             let mut thread_state = thread_state.lock().await;
                             thread_state.track_current_turn_event(&event.msg);
@@ -6333,6 +6314,35 @@ impl CodexMessageProcessor {
                         }
 
                         if !subscribed_connection_ids.is_empty() {
+                            // For now, we send a notification for every event,
+                            // JSON-serializing the `Event` as-is, but these should
+                            // be migrated to be variants of `ServerNotification`
+                            // instead.
+                            let event_formatted = match &event.msg {
+                                EventMsg::TurnStarted(_) => "task_started",
+                                EventMsg::TurnComplete(_) => "task_complete",
+                                _ => &event.msg.to_string(),
+                            };
+                            let request_event_name = format!("codex/event/{event_formatted}");
+                            tracing::trace!(
+                                conversation_id = %conversation_id,
+                                "app-server event: {request_event_name}"
+                            );
+                            let mut params = match serde_json::to_value(&event) {
+                                Ok(serde_json::Value::Object(map)) => map,
+                                Ok(_) => {
+                                    error!("event did not serialize to an object");
+                                    continue;
+                                }
+                                Err(err) => {
+                                    error!("failed to serialize event: {err}");
+                                    continue;
+                                }
+                            };
+                            params.insert(
+                                "conversationId".to_string(),
+                                conversation_id.to_string().into(),
+                            );
                             outgoing_for_task
                                 .send_notification_to_connections(
                                     &subscribed_connection_ids,
@@ -7466,6 +7476,7 @@ pub(crate) async fn read_rollout_items_from_rollout(
     let items = match RolloutRecorder::get_rollout_history(path).await? {
         InitialHistory::New => Vec::new(),
         InitialHistory::Forked(items) => items,
+        InitialHistory::ForkedSnapshot(snapshot) => snapshot.rollout_items(),
         InitialHistory::Resumed(resumed) => resumed.history,
     };
 

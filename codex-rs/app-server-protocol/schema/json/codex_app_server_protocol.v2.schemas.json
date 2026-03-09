@@ -7439,6 +7439,11 @@
             "array",
             "null"
           ]
+        },
+        "typedNotificationsOnly": {
+          "default": false,
+          "description": "When true, suppress legacy `codex/event/*` notifications and rely on typed app-server notifications only.",
+          "type": "boolean"
         }
       },
       "type": "object"

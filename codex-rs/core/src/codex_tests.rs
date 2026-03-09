@@ -966,6 +966,28 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test]
+async fn record_initial_history_reconstructs_forked_snapshot_transcript() {
+    let (session, turn_context) = make_session_and_context().await;
+    let (_rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
+    let snapshot = session
+        .build_forked_history_snapshot(ThreadId::new(), expected.clone())
+        .await;
+
+    session
+        .record_initial_history(InitialHistory::ForkedSnapshot(snapshot))
+        .await;
+
+    let reconstruction_turn = session.new_default_turn().await;
+    expected.extend(
+        session
+            .build_initial_context(reconstruction_turn.as_ref())
+            .await,
+    );
+    let history = session.state.lock().await.clone_history();
+    assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
 async fn record_initial_history_forked_hydrates_previous_turn_settings() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_model = "forked-rollout-model";
@@ -1028,6 +1050,82 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
             model: previous_model.to_string(),
             realtime_active: Some(turn_context.realtime_active),
         })
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_forked_snapshot_hydrates_previous_turn_settings() {
+    let (session, turn_context) = make_session_and_context().await;
+    let previous_model = "forked-snapshot-model";
+    {
+        let mut state = session.state.lock().await;
+        state.set_previous_turn_settings(Some(PreviousTurnSettings {
+            model: previous_model.to_string(),
+            realtime_active: Some(turn_context.realtime_active),
+        }));
+        state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
+    }
+
+    let snapshot = session
+        .build_forked_history_snapshot(ThreadId::new(), Vec::new())
+        .await;
+
+    session
+        .record_initial_history(InitialHistory::ForkedSnapshot(snapshot))
+        .await;
+
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: previous_model.to_string(),
+            realtime_active: Some(turn_context.realtime_active),
+        })
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_forked_snapshot_hydrates_token_info() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let expected = TokenUsageInfo {
+        total_token_usage: TokenUsage::default(),
+        last_token_usage: TokenUsage::default(),
+        model_context_window: Some(321_000),
+    };
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(expected.clone()));
+    }
+
+    let snapshot = session
+        .build_forked_history_snapshot(ThreadId::new(), Vec::new())
+        .await;
+
+    session
+        .record_initial_history(InitialHistory::ForkedSnapshot(snapshot))
+        .await;
+
+    let actual = session.state.lock().await.token_info().expect("token info");
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn record_initial_history_forked_snapshot_hydrates_mcp_tool_selection() {
+    let (session, _turn_context) = make_session_and_context().await;
+    session
+        .set_mcp_tool_selection(vec!["tool-a".to_string(), "tool-b".to_string()])
+        .await;
+
+    let snapshot = session
+        .build_forked_history_snapshot(ThreadId::new(), Vec::new())
+        .await;
+
+    session
+        .record_initial_history(InitialHistory::ForkedSnapshot(snapshot))
+        .await;
+
+    assert_eq!(
+        session.get_mcp_tool_selection().await,
+        Some(vec!["tool-a".to_string(), "tool-b".to_string()])
     );
 }
 

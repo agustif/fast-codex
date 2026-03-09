@@ -149,6 +149,9 @@ pub struct InProcessClientStartArgs {
     pub client_version: String,
     /// Whether experimental APIs are requested at initialize time.
     pub experimental_api: bool,
+    /// Whether this client wants only typed app-server notifications and no
+    /// legacy `codex/event/*` stream.
+    pub typed_notifications_only: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
     /// Queue capacity for command/event channels (clamped to at least 1).
@@ -160,6 +163,7 @@ impl InProcessClientStartArgs {
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
             experimental_api: self.experimental_api,
+            typed_notifications_only: self.typed_notifications_only,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
             } else {
@@ -636,6 +640,7 @@ mod tests {
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            typed_notifications_only: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity,
         })
@@ -645,6 +650,36 @@ mod tests {
 
     async fn start_test_client(session_source: SessionSource) -> InProcessAppServerClient {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+    }
+
+    #[test]
+    fn initialize_params_preserves_typed_notifications_only() {
+        let args = InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: Arc::new(
+                codex_core::config::Config::load_default_with_cli_overrides(Vec::new())
+                    .expect("default config should load"),
+            ),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Exec,
+            enable_codex_api_key_env: false,
+            client_name: "typed-client".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            typed_notifications_only: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        };
+
+        let params = args.initialize_params();
+        let capabilities = params.capabilities.expect("capabilities should be present");
+        assert_eq!(capabilities.experimental_api, true);
+        assert_eq!(capabilities.typed_notifications_only, true);
+        assert_eq!(capabilities.opt_out_notification_methods, None);
     }
 
     #[tokio::test]

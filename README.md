@@ -56,6 +56,8 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
+- [**Fast Codex Fork Ledger**](./docs/fast-codex-fork.md)
+- [**Fast Codex Performance Roadmap**](./docs/fast-codex-performance-roadmap.md)
 
 ## Fast Codex Fork Notes
 
@@ -69,13 +71,18 @@ The fork policy is simple:
 
 ### Main branch deltas
 
-These are the only changes we intend to keep on fork `main`:
+The full fork ledger lives in [docs/fast-codex-fork.md](./docs/fast-codex-fork.md).
+
+The major deltas currently carried on fork `main` are:
 
 | Delta | Purpose |
 | --- | --- |
 | `scripts/sync-upstream.sh` | Fetch `upstream/main`, sync the fork's `main` branch safely, optionally push it, and print the remaining local delta branches. |
 | This README section | Keep a human-readable ledger of fork policy, branch deltas, and upstreaming status. |
 | Disconnect-driven orphaned-thread cleanup in `codex-rs/app-server` | Prevent zero-subscriber threads from staying loaded after unexpected disconnects and reconcile late `ShutdownComplete` bookkeeping. |
+| Typed notification fast path | Allow clients to opt out of legacy `codex/event/*` notifications and reduce duplicate event-delivery work. |
+| Subagent fork and rollout optimizations | Reduce parent-history replay cost by using in-memory fork snapshots and streamed rollout parsing. |
+| Startup and logging reductions | Lazy file watching, cheaper app-server startup preload, and lower-cost DB-backed logging defaults. |
 
 ### Active non-main deltas
 
@@ -85,7 +92,7 @@ Historical note:
 
 - the orphaned-thread fix was reported upstream in [openai/codex#14137](https://github.com/openai/codex/issues/14137)
 - upstream explicitly said they no longer generally accept external PRs and may not prioritize this bug soon
-- this fork therefore carries that fix on `main` directly
+- this fork therefore carries its performance fixes on `main` directly
 
 ### Upstream sync workflow
 
