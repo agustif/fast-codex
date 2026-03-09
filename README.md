@@ -58,6 +58,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Open source fund**](./docs/open-source-fund.md)
 - [**Fast Codex Fork Ledger**](./docs/fast-codex-fork.md)
 - [**Fast Codex Performance Roadmap**](./docs/fast-codex-performance-roadmap.md)
+- [**Fast Codex Review (2026-03-10)**](./docs/fast-codex-review-2026-03-10.md)
 
 ## Fast Codex Fork Notes
 
