@@ -57,4 +57,51 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+## Fast Codex Fork Notes
+
+`agustif/fast-codex` is a maintenance fork of [`openai/codex`](https://github.com/openai/codex).
+The fork policy is simple:
+
+- `main` should stay as close to `upstream/main` as possible
+- fork-specific housekeeping on `main` must stay small and documented here
+- candidate product or bugfix deltas should live on short-lived branches until they are accepted upstream
+
+### Main branch deltas
+
+These are the only changes we intend to keep on fork `main`:
+
+| Delta | Purpose |
+| --- | --- |
+| `scripts/sync-upstream.sh` | Fetch `upstream/main`, sync the fork's `main` branch safely, optionally push it, and print the remaining local delta branches. |
+| This README section | Keep a human-readable ledger of fork policy, branch deltas, and upstreaming status. |
+
+### Active non-main deltas
+
+| Branch | Status | Why it exists |
+| --- | --- | --- |
+| `fix/app-server-orphaned-thread-unload` | Waiting on upstream contributor path | Minimal `codex-rs/app-server` fix for disconnect-driven orphaned thread retention. See [openai/codex#14137](https://github.com/openai/codex/issues/14137) and the [compare view](https://github.com/openai/codex/compare/main...agustif:fix/app-server-orphaned-thread-unload?expand=1). |
+
+If a branch is meant to survive for more than a short review window, it should be listed here. If it is not listed here, treat it as disposable.
+
+### Upstream sync workflow
+
+From the repo root:
+
+```shell
+./scripts/sync-upstream.sh
+```
+
+Dry run without pushing:
+
+```shell
+./scripts/sync-upstream.sh --dry-run --no-push
+```
+
+The sync helper:
+
+- refuses to run on a dirty worktree
+- fast-forwards `main` when there are no fork-only commits on top of upstream
+- merges `upstream/main` into `main` when fork-only commits already exist on `main`
+- prints the currently active local delta branches after syncing
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).
