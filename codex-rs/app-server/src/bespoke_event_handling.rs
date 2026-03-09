@@ -9,6 +9,7 @@ use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::server_request_error::is_turn_transition_server_request_error;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
+use crate::thread_state::ThreadStateManager;
 use crate::thread_state::TurnSummary;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
@@ -70,6 +71,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::TerminalInteractionNotification;
+use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -187,6 +189,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_manager: Arc<ThreadManager>,
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
+    thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     api_version: ApiVersion,
     fallback_model_provider: String,
@@ -1678,6 +1681,22 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_thread_shutdown(&conversation_id.to_string())
                 .await;
+            if thread_manager.get_thread(conversation_id).await.is_err() {
+                thread_state_manager
+                    .remove_thread_state(conversation_id)
+                    .await;
+                thread_watch_manager
+                    .remove_thread(&conversation_id.to_string())
+                    .await;
+                if let ApiVersion::V2 = api_version {
+                    let notification = ThreadClosedNotification {
+                        thread_id: conversation_id.to_string(),
+                    };
+                    outgoing
+                        .send_server_notification(ServerNotification::ThreadClosed(notification))
+                        .await;
+                }
+            }
         }
 
         _ => {}
@@ -2590,7 +2609,12 @@ mod tests {
     use anyhow::anyhow;
     use anyhow::bail;
     use codex_app_server_protocol::JSONRPCErrorError;
+    use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::TurnPlanStepStatus;
+    use codex_core::CodexAuth;
+    use codex_core::config::ConfigBuilder;
+    use codex_core::test_support::thread_manager_with_models_provider_and_home;
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::MacOsAutomationPermission;
     use codex_protocol::models::MacOsPreferencesPermission;
@@ -2609,8 +2633,10 @@ mod tests {
     use rmcp::model::Content;
     use serde_json::Value as JsonValue;
     use std::time::Duration;
+    use tempfile::TempDir;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
     fn new_thread_state() -> Arc<Mutex<ThreadState>> {
         Arc::new(Mutex::new(ThreadState::default()))
@@ -2627,6 +2653,106 @@ mod tests {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_complete_cleans_up_stale_thread_state_and_notifies_clients() -> Result<()> {
+        let home = TempDir::new()?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .build()
+            .await?;
+        let thread_manager = Arc::new(thread_manager_with_models_provider_and_home(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.clone(),
+        ));
+        let new_thread = thread_manager.start_thread(config.clone()).await?;
+        let conversation_id = new_thread.thread_id;
+        let conversation = new_thread.thread;
+        let config_snapshot = conversation.config_snapshot().await;
+        let removed = thread_manager.remove_thread(&conversation_id).await;
+        assert!(removed.is_some());
+
+        let thread_state_manager = ThreadStateManager::new();
+        let connection_id = ConnectionId(1);
+        thread_state_manager
+            .connection_initialized(connection_id)
+            .await;
+        let thread_state = thread_state_manager
+            .try_ensure_connection_subscribed(conversation_id, connection_id, false)
+            .await
+            .expect("connection should be subscribed");
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        thread_state.lock().await.cancel_tx = Some(cancel_tx);
+
+        let thread_watch_manager = ThreadWatchManager::new();
+        thread_watch_manager
+            .upsert_thread_silently(Thread {
+                id: conversation_id.to_string(),
+                preview: String::new(),
+                ephemeral: config_snapshot.ephemeral,
+                model_provider: config_snapshot.model_provider_id.clone(),
+                created_at: 0,
+                updated_at: 0,
+                status: ThreadStatus::NotLoaded,
+                path: conversation.rollout_path(),
+                cwd: config_snapshot.cwd.clone(),
+                cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                agent_nickname: config_snapshot.session_source.get_nickname(),
+                agent_role: config_snapshot.session_source.get_agent_role(),
+                source: config_snapshot.session_source.clone().into(),
+                git_info: None,
+                name: None,
+                turns: Vec::new(),
+            })
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing =
+            ThreadScopedOutgoingMessageSender::new(outgoing, vec![connection_id], conversation_id);
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-shutdown".to_string(),
+                msg: EventMsg::ShutdownComplete,
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state.clone(),
+            thread_state_manager.clone(),
+            thread_watch_manager.clone(),
+            ApiVersion::V2,
+            config.model_provider_id.clone(),
+            home.path(),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ThreadClosed(n)) => {
+                assert_eq!(n.thread_id, conversation_id.to_string());
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_millis(50), &mut cancel_rx)
+            .await
+            .expect("listener cancellation should be signalled")
+            .expect("listener cancellation channel should resolve");
+        assert!(!thread_state_manager.has_subscribers(conversation_id).await);
+        assert_eq!(
+            thread_watch_manager
+                .loaded_status_for_thread(&conversation_id.to_string())
+                .await,
+            codex_app_server_protocol::ThreadStatus::NotLoaded
+        );
+        assert!(thread_state.lock().await.cancel_tx.is_none());
+        Ok(())
     }
 
     #[test]
