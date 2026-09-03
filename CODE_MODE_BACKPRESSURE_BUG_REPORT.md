@@ -180,18 +180,18 @@ That independent source-build problem is already tracked by `openai/codex#36698`
 Use a bounded channel with capacity one. Fill it, then attempt a second `try_send` before receiving the first frame.
 
 ```rust
-let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
-tx.try_send(first_frame).unwrap();
+tx.try_send(1_u8).unwrap();
 assert!(matches!(
-    tx.try_send(second_frame),
+    tx.try_send(2_u8),
     Err(tokio::sync::mpsc::error::TrySendError::Full(_))
 ));
 ```
 
 The existing implementation converts this normal `Full` state into a fatal connection failure.
 
-The patched behavior keeps the second send pending until `rx.recv()` releases capacity.
+The patched behavior keeps the second send pending until the receiver releases capacity.
 
 ## Expected behavior
 
