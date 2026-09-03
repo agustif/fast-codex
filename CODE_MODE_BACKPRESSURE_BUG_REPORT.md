@@ -2,6 +2,8 @@
 
 Report date: 2026-09-03
 
+Upstream issue: [openai/codex#42527](https://github.com/openai/codex/issues/42527)
+
 ## Summary
 
 Codex Code Mode treats temporary bounded-channel saturation as a fatal transport failure.
