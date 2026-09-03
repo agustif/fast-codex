@@ -51,8 +51,9 @@ mod grpc_transport;
 mod peer;
 mod transport;
 
-const MAX_IN_FLIGHT_REQUESTS: usize = 256;
-const MAX_ACTIVE_CELLS: usize = 128;
+/// One agent can hold both an execute and a wait request while its cell remains active.
+const MAX_ACTIVE_CELLS: usize = 512;
+const MAX_IN_FLIGHT_REQUESTS: usize = MAX_ACTIVE_CELLS * 2;
 const MAX_RECENT_REQUEST_IDS: usize = 4096;
 const MAX_RECENT_SESSION_IDS: usize = 4096;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -158,7 +159,7 @@ where
                     anyhow::bail!("received a second code-mode client hello");
                 }
                 ClientToHost::Request { id, request } => {
-                    state.spawn_request(id, request)?;
+                    state.spawn_request(id, request).await?;
                 }
                 ClientToHost::CancelRequest { id } => {
                     state.cancel_request(id);
@@ -297,7 +298,7 @@ struct HostState {
 }
 
 impl HostState {
-    fn spawn_request(
+    async fn spawn_request(
         self: &Arc<Self>,
         request_id: RequestId,
         request: HostRequest,
@@ -314,7 +315,8 @@ impl HostState {
             self.respond(
                 request_id,
                 Err("code-mode host has too many in-flight requests".to_string()),
-            );
+            )
+            .await;
             self.finish_request(request_id);
             return Ok(());
         };
@@ -364,7 +366,8 @@ impl HostState {
             self.respond(
                 request_id,
                 Err("code-mode host is shutting down".to_string()),
-            );
+            )
+            .await;
             return;
         }
         match request {
@@ -378,14 +381,15 @@ impl HostState {
                 .map_err(|error| format!("invalid code-mode session execution limits: {error}"))
                 .and_then(|limits| self.open_session(session_id.clone(), limits))
                 .map(|()| HostResponse::SessionReady { session_id });
-                self.respond(request_id, result);
+                self.respond(request_id, result).await;
             }
             HostRequest::Execute {
                 session_id,
                 request,
             } => {
                 if cancellation.is_cancelled() {
-                    self.respond(request_id, Err("code-mode request cancelled".to_string()));
+                    self.respond(request_id, Err("code-mode request cancelled".to_string()))
+                        .await;
                     return;
                 }
                 let request = match request.try_into() {
@@ -394,14 +398,15 @@ impl HostState {
                         self.respond(
                             request_id,
                             Err(format!("invalid code-mode execute request: {err}")),
-                        );
+                        )
+                        .await;
                         return;
                     }
                 };
                 let session = match self.session(&session_id) {
                     Ok(session) => session,
                     Err(err) => {
-                        self.respond(request_id, Err(err));
+                        self.respond(request_id, Err(err)).await;
                         return;
                     }
                 };
@@ -409,7 +414,8 @@ impl HostState {
                     self.respond(
                         request_id,
                         Err("code-mode host has too many active cells".to_string()),
-                    );
+                    )
+                    .await;
                     return;
                 };
                 let result = session.execute(request).await;
@@ -421,7 +427,8 @@ impl HostState {
                             Ok(HostResponse::ExecutionStarted {
                                 cell_id: cell_id.into(),
                             }),
-                        );
+                        )
+                        .await;
                         let initial_response_sent = self.peer.start_cell(
                             session_id,
                             request_id,
@@ -431,7 +438,7 @@ impl HostState {
                         );
                         let _ = initial_response_sent.await;
                     }
-                    Err(err) => self.respond(request_id, Err(err)),
+                    Err(err) => self.respond(request_id, Err(err)).await,
                 }
             }
             HostRequest::Wait {
@@ -456,7 +463,7 @@ impl HostState {
                     }
                     Err(err) => Err(err),
                 };
-                self.respond(request_id, result);
+                self.respond(request_id, result).await;
             }
             HostRequest::Terminate {
                 session_id,
@@ -472,7 +479,7 @@ impl HostState {
                     }),
                     Err(err) => Err(err),
                 };
-                self.respond(request_id, result);
+                self.respond(request_id, result).await;
             }
             HostRequest::ShutdownSession { session_id } => {
                 let session = self
@@ -490,7 +497,7 @@ impl HostState {
                     },
                     None => Err(format!("unknown code-mode session {session_id}")),
                 };
-                self.respond(request_id, result);
+                self.respond(request_id, result).await;
             }
         }
     }
@@ -549,8 +556,8 @@ impl HostState {
             .ok_or_else(|| format!("unknown code-mode session {session_id}"))
     }
 
-    fn respond(&self, id: RequestId, result: Result<HostResponse, String>) {
-        self.peer.respond(id, result);
+    async fn respond(&self, id: RequestId, result: Result<HostResponse, String>) {
+        self.peer.respond(id, result).await;
     }
 
     fn cancel_request(&self, request_id: RequestId) {

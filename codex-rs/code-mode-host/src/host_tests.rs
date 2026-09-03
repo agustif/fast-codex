@@ -39,6 +39,7 @@ use tokio_util::task::TaskTracker;
 
 use super::HostLimits;
 use super::HostState;
+use super::MAX_ACTIVE_CELLS;
 use super::MAX_IN_FLIGHT_REQUESTS;
 use super::MAX_RECENT_REQUEST_IDS;
 use super::RequestKind;
@@ -531,6 +532,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
                 request: execute_request("await new Promise(() => {});"),
             },
         )
+        .await
         .expect("spawn execute request");
     let started = decode_frame(outgoing_rx.recv().await.expect("execution started frame")).await;
     let HostToClient::Response {
@@ -563,14 +565,15 @@ async fn execute_request_id_remains_active_until_initial_response() {
 }
 
 #[tokio::test]
-async fn active_cell_limit_rejects_execute_without_disconnecting() {
+async fn active_cell_admission_accepts_512_permits_and_rejects_the_513th() {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let active_cell_permits = Arc::new(Semaphore::new(MAX_ACTIVE_CELLS));
     let state = HostState {
         sessions: Mutex::new(HashMap::new()),
         limits: Arc::new(HostLimits {
             request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
-            active_cell_permits: Arc::new(Semaphore::new(/*permits*/ 0)),
+            active_cell_permits: Arc::clone(&active_cell_permits),
         }),
         seen_session_ids: Mutex::new(SeenSessionIds::default()),
         requests: Mutex::new(RequestRegistry::default()),
@@ -586,6 +589,11 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
         )
         .expect("open session");
     let request_id = request_id(/*value*/ 1);
+    let admitted_cells = Arc::clone(&active_cell_permits)
+        .acquire_many_owned(MAX_ACTIVE_CELLS as u32)
+        .await
+        .expect("admit 512 active cells");
+    assert_eq!(active_cell_permits.available_permits(), 0);
 
     state
         .handle_request(
@@ -609,6 +617,8 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
         }
     );
     assert!(!peer.is_disconnected());
+    drop(admitted_cells);
+    assert_eq!(active_cell_permits.available_permits(), MAX_ACTIVE_CELLS);
     state.disconnect().await;
 }
 

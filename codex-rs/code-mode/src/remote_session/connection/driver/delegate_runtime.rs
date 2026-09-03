@@ -249,7 +249,7 @@ impl DelegateRuntime {
 }
 
 impl ConnectionDriver {
-    pub(super) fn start_delegate(
+    pub(super) async fn start_delegate(
         &mut self,
         id: DelegateRequestId,
         session_id: SessionId,
@@ -261,7 +261,7 @@ impl ConnectionDriver {
         };
         let target = match self.sessions.delegate_target(&session_id, wire_cell_id) {
             Ok(target) => target,
-            Err(err) => return self.send_delegate_response(id, Err(err)),
+            Err(err) => return self.send_delegate_response(id, Err(err)).await,
         };
         match self.delegates.start(id, target, request) {
             Ok(()) => true,
@@ -269,25 +269,28 @@ impl ConnectionDriver {
                 self.fail(format!("duplicate code-mode delegate request ID {id:?}"));
                 false
             }
-            Err(DelegateStartError::CapacityExceeded) => self.send_delegate_response(
-                id,
-                Err(format!(
-                    "code-mode host exceeded the limit of {MAX_PENDING_DELEGATE_CALLS} pending delegate calls"
-                )),
-            ),
+            Err(DelegateStartError::CapacityExceeded) => {
+                self.send_delegate_response(
+                    id,
+                    Err(format!(
+                        "code-mode host exceeded the limit of {MAX_PENDING_DELEGATE_CALLS} pending delegate calls"
+                    )),
+                )
+                .await
+            }
         }
     }
 
-    pub(super) fn complete_delegate(
+    pub(super) async fn complete_delegate(
         &mut self,
         id: DelegateRequestId,
         result: Result<DelegateResponse, String>,
     ) -> bool {
         let effects = self.delegates.complete(id, result);
-        self.apply_delegate_effects(effects)
+        self.apply_delegate_effects(effects).await
     }
 
-    fn send_delegate_response(
+    async fn send_delegate_response(
         &mut self,
         id: DelegateRequestId,
         result: Result<DelegateResponse, String>,
@@ -318,10 +321,10 @@ impl ConnectionDriver {
                 }
             }
         };
-        self.queue_frame(frame)
+        self.queue_frame(frame).await
     }
 
-    pub(super) fn close_cell(&mut self, session_id: SessionId, cell_id: WireCellId) -> bool {
+    pub(super) async fn close_cell(&mut self, session_id: SessionId, cell_id: WireCellId) -> bool {
         let owner = match self.sessions.remove_cell(&session_id, &cell_id) {
             Ok(owner) => owner,
             Err(err) => {
@@ -330,7 +333,7 @@ impl ConnectionDriver {
             }
         };
         let effects = self.delegates.close_cell(owner);
-        self.apply_delegate_effects(effects)
+        self.apply_delegate_effects(effects).await
     }
 
     pub(super) fn close_session_locally(&mut self, session_id: &SessionId) -> DelegateEffects {
@@ -339,9 +342,9 @@ impl ConnectionDriver {
         self.delegates.close_cells(owners)
     }
 
-    pub(super) fn apply_delegate_effects(&mut self, effects: DelegateEffects) -> bool {
+    pub(super) async fn apply_delegate_effects(&mut self, effects: DelegateEffects) -> bool {
         if let Some((id, result)) = effects.response
-            && !self.send_delegate_response(id, result)
+            && !self.send_delegate_response(id, result).await
         {
             return false;
         }

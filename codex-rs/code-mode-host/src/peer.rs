@@ -79,13 +79,13 @@ impl HostPeer {
         }
     }
 
-    pub(super) fn send(&self, message: HostToClient) -> Result<(), PeerSendError> {
+    pub(super) async fn send(&self, message: HostToClient) -> Result<(), PeerSendError> {
         let frame = EncodedFrame::encode(&message)
             .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        self.send_frame(frame)
+        self.send_frame(frame).await
     }
 
-    pub(super) fn respond(
+    pub(super) async fn respond(
         &self,
         id: RequestId,
         result: Result<codex_code_mode_protocol::host::HostResponse, String>,
@@ -94,30 +94,36 @@ impl HostPeer {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::Response {
-                id,
-                result: WireResult::Err {
-                    message: format!("code-mode host response exceeds the IPC frame limit: {err}"),
-                },
-            });
+        if let Err(PeerSendError::Payload(err)) = self.send(message).await {
+            let _ = self
+                .send(HostToClient::Response {
+                    id,
+                    result: WireResult::Err {
+                        message: format!(
+                            "code-mode host response exceeds the IPC frame limit: {err}"
+                        ),
+                    },
+                })
+                .await;
         }
     }
 
-    fn initial_response(&self, id: RequestId, result: Result<WireRuntimeResponse, String>) {
+    async fn initial_response(&self, id: RequestId, result: Result<WireRuntimeResponse, String>) {
         let message = HostToClient::InitialResponse {
             id,
             result: WireResult::from_result(result),
         };
-        if let Err(PeerSendError::Payload(err)) = self.send(message) {
-            let _ = self.send(HostToClient::InitialResponse {
-                id,
-                result: WireResult::Err {
-                    message: format!(
-                        "code-mode initial response exceeds the IPC frame limit: {err}"
-                    ),
-                },
-            });
+        if let Err(PeerSendError::Payload(err)) = self.send(message).await {
+            let _ = self
+                .send(HostToClient::InitialResponse {
+                    id,
+                    result: WireResult::Err {
+                        message: format!(
+                            "code-mode initial response exceeds the IPC frame limit: {err}"
+                        ),
+                    },
+                })
+                .await;
         }
     }
 
@@ -149,14 +155,17 @@ impl HostPeer {
             DelegateRequest::Notify { cell_id, .. } => cell_id.clone().into(),
         };
         let (dispatched_tx, dispatched_rx) = oneshot::channel();
-        if let Err(err) = self.route_cell_message(
-            (session_id, cell_id),
-            CellMessage::Delegate {
-                id,
-                request,
-                dispatched_tx,
-            },
-        ) {
+        if let Err(err) = self
+            .route_cell_message(
+                (session_id, cell_id),
+                CellMessage::Delegate {
+                    id,
+                    request,
+                    dispatched_tx,
+                },
+            )
+            .await
+        {
             self.pending.lock().await.remove(&id);
             pending.disarm();
             return Err(err);
@@ -187,7 +196,7 @@ impl HostPeer {
             }
             _ = cancellation_token.cancelled() => {
                 if self.remove_pending(id).await.is_some() {
-                    let _ = self.send(HostToClient::CancelDelegateRequest { id });
+                    let _ = self.send(HostToClient::CancelDelegateRequest { id }).await;
                 }
                 pending.disarm();
                 Err("code mode delegate request cancelled".to_string())
@@ -260,8 +269,13 @@ impl HostPeer {
         initial_response_sent_rx
     }
 
-    pub(super) fn close_cell(&self, session_id: SessionId, cell_id: CellId) {
-        let _ = self.route_cell_message((session_id, cell_id), CellMessage::Closed);
+    pub(super) fn close_cell(self: &Arc<Self>, session_id: SessionId, cell_id: CellId) {
+        let peer = Arc::clone(self);
+        self.spawn_critical("cell close routing", async move {
+            let _ = peer
+                .route_cell_message((session_id, cell_id), CellMessage::Closed)
+                .await;
+        });
     }
 
     pub(super) fn disconnect(&self) {
@@ -322,6 +336,26 @@ impl HostPeer {
         request: DelegateRequest,
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     ) {
+        let message = HostToClient::DelegateRequest {
+            id,
+            session_id,
+            request,
+        };
+        let frame = match EncodedFrame::encode(&message) {
+            Ok(frame) => frame,
+            Err(err) => {
+                let _ = dispatched_tx.send(Err(err.to_string()));
+                return;
+            }
+        };
+        let permit = match self.outgoing_tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.disconnect();
+                let _ = dispatched_tx.send(Err("code-mode client connection closed".to_string()));
+                return;
+            }
+        };
         let result = {
             let mut pending = self.pending.lock().await;
             let Some(pending) = pending.get_mut(&id) else {
@@ -330,53 +364,46 @@ impl HostPeer {
                 ));
                 return;
             };
-            match self.send(HostToClient::DelegateRequest {
-                id,
-                session_id,
-                request,
-            }) {
-                Ok(()) => {
-                    pending.dispatched = true;
-                    Ok(())
-                }
-                Err(err) => Err(err.to_string()),
-            }
+            permit.send(frame);
+            pending.dispatched = true;
+            Ok(())
         };
         let _ = dispatched_tx.send(result);
     }
 
-    fn route_cell_message(
+    async fn route_cell_message(
         &self,
         key: (SessionId, CellId),
         message: CellMessage,
     ) -> Result<(), String> {
         use std::collections::hash_map::Entry;
 
-        let result = match self
-            .cell_routes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(key)
-        {
-            Entry::Occupied(mut entry) => match entry.get_mut() {
-                CellRoute::Pending(messages) if messages.len() < CELL_MESSAGE_CAPACITY => {
-                    messages.push_back(message);
-                    Ok(())
+        let active_sender = {
+            let mut routes = self
+                .cell_routes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match routes.entry(key) {
+                Entry::Occupied(mut entry) => match entry.get_mut() {
+                    CellRoute::Pending(messages) if messages.len() < CELL_MESSAGE_CAPACITY => {
+                        messages.push_back(message);
+                        return Ok(());
+                    }
+                    CellRoute::Pending(_) => {
+                        return Err("code-mode cell message queue is full".to_string());
+                    }
+                    CellRoute::Active(sender) => sender.clone(),
+                },
+                Entry::Vacant(entry) => {
+                    entry.insert(CellRoute::Pending(VecDeque::from([message])));
+                    return Ok(());
                 }
-                CellRoute::Pending(_) => Err("code-mode cell message queue is full".to_string()),
-                CellRoute::Active(sender) => sender
-                    .try_send(message)
-                    .map_err(|_| "code-mode cell message queue is unavailable".to_string()),
-            },
-            Entry::Vacant(entry) => {
-                entry.insert(CellRoute::Pending(VecDeque::from([message])));
-                Ok(())
             }
         };
-        if result.is_err() {
-            self.disconnect();
-        }
-        result
+        active_sender
+            .send(message)
+            .await
+            .map_err(|_| "code-mode cell message queue is unavailable".to_string())
     }
 
     async fn remove_pending(&self, id: DelegateRequestId) -> Option<PendingDelegate> {
@@ -396,16 +423,10 @@ impl HostPeer {
         });
     }
 
-    fn send_frame(&self, frame: EncodedFrame) -> Result<(), PeerSendError> {
-        match self.outgoing_tx.try_send(frame) {
+    async fn send_frame(&self, frame: EncodedFrame) -> Result<(), PeerSendError> {
+        match self.outgoing_tx.send(frame).await {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.disconnect();
-                Err(PeerSendError::Unavailable(
-                    "code-mode host outgoing queue is full".to_string(),
-                ))
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(_) => {
                 self.disconnect();
                 Err(PeerSendError::Unavailable(
                     "code-mode client connection closed".to_string(),
@@ -439,7 +460,8 @@ async fn drive_cell(
                         let response = response.with_code_mode_host_duration(code_mode_host_duration);
                         WireRuntimeResponse::try_from(response).map_err(|error| error.to_string())
                     }),
-                );
+                )
+                .await;
                 if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
                     let _ = initial_response_sent_tx.send(());
                 }
@@ -471,7 +493,8 @@ async fn drive_cell(
                 let response = response.with_code_mode_host_duration(code_mode_host_duration);
                 WireRuntimeResponse::try_from(response).map_err(|error| error.to_string())
             }),
-        );
+        )
+        .await;
         if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
             let _ = initial_response_sent_tx.send(());
         }
@@ -495,10 +518,12 @@ async fn drive_cell(
             }
         }
     }
-    let _ = peer.send(HostToClient::CellClosed {
-        session_id: key.0.clone(),
-        cell_id: (&key.1).into(),
-    });
+    let _ = peer
+        .send(HostToClient::CellClosed {
+            session_id: key.0.clone(),
+            cell_id: (&key.1).into(),
+        })
+        .await;
     peer.remove_cell_route(&key);
 }
 
@@ -515,6 +540,7 @@ impl HostPeer {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum PeerSendError {
     Payload(String),
     Unavailable(String),
@@ -553,7 +579,7 @@ impl Drop for PendingDelegateRequest {
             if let Some(pending) = peer.remove_pending(id).await
                 && pending.dispatched
             {
-                let _ = peer.send(HostToClient::CancelDelegateRequest { id });
+                let _ = peer.send(HostToClient::CancelDelegateRequest { id }).await;
             }
         });
     }

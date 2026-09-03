@@ -6,8 +6,11 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::DelegateRequest;
+use codex_code_mode_protocol::host::EncodedFrame;
+use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
+use codex_code_mode_protocol::host::WireResult;
 use pretty_assertions::assert_eq;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -20,6 +23,21 @@ use super::MAX_PENDING_DELEGATE_CALLS;
 
 fn session_id(value: &str) -> SessionId {
     SessionId::new(value).expect("session ID")
+}
+
+fn response_message(value: i64) -> HostToClient {
+    HostToClient::Response {
+        id: RequestId::new(value),
+        result: WireResult::Err {
+            message: format!("response-{value}"),
+        },
+    }
+}
+
+fn encoded_bytes(message: &HostToClient) -> Vec<u8> {
+    EncodedFrame::encode(message)
+        .expect("encode test frame")
+        .into_framed_bytes()
 }
 
 #[tokio::test]
@@ -95,4 +113,71 @@ async fn pending_delegate_limit_rejects_call_without_disconnecting() {
     );
     assert!(!peer.is_disconnected());
     drop(permits);
+}
+
+#[tokio::test]
+async fn full_outgoing_queue_backpressures_without_disconnecting() {
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
+    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    peer.send(response_message(/*value*/ 1))
+        .await
+        .expect("enqueue first response");
+
+    let blocked_peer = Arc::clone(&peer);
+    let blocked_send = tokio::spawn(async move {
+        blocked_peer.send(response_message(/*value*/ 2)).await
+    });
+    tokio::task::yield_now().await;
+
+    assert!(!blocked_send.is_finished());
+    assert!(!peer.is_disconnected());
+    assert_eq!(
+        outgoing_rx
+            .recv()
+            .await
+            .expect("first response")
+            .into_framed_bytes(),
+        encoded_bytes(&response_message(/*value*/ 1))
+    );
+    blocked_send
+        .await
+        .expect("blocked send task")
+        .expect("enqueue second response");
+    assert_eq!(
+        outgoing_rx
+            .recv()
+            .await
+            .expect("second response")
+            .into_framed_bytes(),
+        encoded_bytes(&response_message(/*value*/ 2))
+    );
+    assert!(!peer.is_disconnected());
+}
+
+#[tokio::test]
+async fn bounded_queue_preserves_fifo_order_for_512_cell_class_burst() {
+    const CELL_CLASS_BURST: i64 = 512;
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*max_capacity*/ 8);
+    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let producer = tokio::spawn(async move {
+        for value in 0..CELL_CLASS_BURST {
+            peer.send(response_message(value)).await?;
+        }
+        Ok::<(), super::PeerSendError>(())
+    });
+
+    for value in 0..CELL_CLASS_BURST {
+        assert_eq!(
+            outgoing_rx
+                .recv()
+                .await
+                .expect("burst response")
+                .into_framed_bytes(),
+            encoded_bytes(&response_message(value))
+        );
+    }
+    producer
+        .await
+        .expect("burst producer task")
+        .expect("enqueue burst");
 }

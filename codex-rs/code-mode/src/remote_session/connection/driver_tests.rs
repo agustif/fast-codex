@@ -44,6 +44,43 @@ use super::DriverLifecycle;
 use super::RemoteSession;
 use super::SessionCleanup;
 
+struct QueueFrameHarness {
+    driver: ConnectionDriver,
+    outgoing_rx: mpsc::Receiver<EncodedFrame>,
+    cancellation: CancellationToken,
+    alive: Arc<AtomicBool>,
+    failure: Arc<StdMutex<Option<String>>>,
+}
+
+impl QueueFrameHarness {
+    fn with_capacity(capacity: usize) -> Self {
+        let (_command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 1);
+        let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 1);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(capacity);
+        let cancellation = CancellationToken::new();
+        let alive = Arc::new(AtomicBool::new(true));
+        let failure = Arc::new(StdMutex::new(None));
+        let (driver, _execute_claim_tx) = ConnectionDriver::new(
+            command_rx,
+            event_rx,
+            event_tx,
+            outgoing_tx,
+            DriverLifecycle {
+                alive: Arc::clone(&alive),
+                failure: Arc::clone(&failure),
+                cancellation: cancellation.clone(),
+            },
+        );
+        Self {
+            driver,
+            outgoing_rx,
+            cancellation,
+            alive,
+            failure,
+        }
+    }
+}
+
 struct DriverHarness {
     command_tx: mpsc::Sender<DriverCommand>,
     event_tx: mpsc::Sender<DriverEvent>,
@@ -53,6 +90,105 @@ struct DriverHarness {
     alive: Arc<AtomicBool>,
     failure: Arc<StdMutex<Option<String>>>,
     driver_task: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn capacity_one_outgoing_queue_backpressures_without_disconnect_and_preserves_fifo() {
+    let mut harness = QueueFrameHarness::with_capacity(/*capacity*/ 1);
+    let first = ClientToHost::CancelRequest {
+        id: RequestId::new(/*value*/ 1),
+    };
+    let second = ClientToHost::CancelRequest {
+        id: RequestId::new(/*value*/ 2),
+    };
+
+    assert!(
+        harness
+            .driver
+            .queue_frame(EncodedFrame::encode(&first).expect("encode first cancellation"))
+            .await
+    );
+    let second_send = harness
+        .driver
+        .queue_frame(EncodedFrame::encode(&second).expect("encode second cancellation"));
+    tokio::pin!(second_send);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut second_send)
+            .await
+            .is_err(),
+        "the second frame should wait for bounded queue capacity"
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+    assert_eq!(*harness.failure.lock().expect("failure lock"), None);
+
+    let first_frame = harness
+        .outgoing_rx
+        .recv()
+        .await
+        .expect("first queued frame");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut second_send)
+            .await
+            .expect("second frame should use released capacity")
+    );
+    let second_frame = harness
+        .outgoing_rx
+        .recv()
+        .await
+        .expect("second queued frame");
+
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&first_frame.into_framed_bytes())
+            .expect("decode first frame"),
+        first
+    );
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&second_frame.into_framed_bytes())
+            .expect("decode second frame"),
+        second
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+    assert_eq!(*harness.failure.lock().expect("failure lock"), None);
+}
+
+#[tokio::test]
+async fn connection_cancellation_preempts_a_capacity_one_backpressured_send() {
+    let mut harness = QueueFrameHarness::with_capacity(/*capacity*/ 1);
+    let first = ClientToHost::CancelRequest {
+        id: RequestId::new(/*value*/ 1),
+    };
+    let second = ClientToHost::CancelRequest {
+        id: RequestId::new(/*value*/ 2),
+    };
+
+    assert!(
+        harness
+            .driver
+            .queue_frame(EncodedFrame::encode(&first).expect("encode first cancellation"))
+            .await
+    );
+    let second_send = harness
+        .driver
+        .queue_frame(EncodedFrame::encode(&second).expect("encode second cancellation"));
+    tokio::pin!(second_send);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut second_send)
+            .await
+            .is_err(),
+        "the second frame should wait for bounded queue capacity"
+    );
+
+    harness.cancellation.cancel();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(1), &mut second_send)
+            .await
+            .expect("connection cancellation should preempt backpressure")
+    );
+    assert!(!harness.alive.load(Ordering::Acquire));
+    assert_eq!(
+        harness.failure.lock().expect("failure lock").as_deref(),
+        Some("code-mode host connection closed")
+    );
 }
 
 impl DriverHarness {

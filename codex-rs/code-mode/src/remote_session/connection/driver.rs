@@ -93,7 +93,7 @@ impl ConnectionDriver {
                         self.fail("code-mode host event stream closed".to_string());
                         return;
                     };
-                    if !self.cancel_dropped_callers() || !self.handle_event(event) {
+                    if !self.cancel_dropped_callers().await || !self.handle_event(event).await {
                         return;
                     }
                 }
@@ -109,7 +109,7 @@ impl ConnectionDriver {
                         self.fail("code-mode host command stream closed".to_string());
                         return;
                     };
-                    if !self.cancel_dropped_callers() || !self.handle_command(command) {
+                    if !self.cancel_dropped_callers().await || !self.handle_command(command).await {
                         return;
                     }
                 }
@@ -117,33 +117,40 @@ impl ConnectionDriver {
         }
     }
 
-    fn handle_event(&mut self, event: DriverEvent) -> bool {
+    async fn handle_event(&mut self, event: DriverEvent) -> bool {
         let keep_running = match event {
-            DriverEvent::HostMessage(message) => self.handle_host_message(message),
-            DriverEvent::DelegateCompleted { id, result } => self.complete_delegate(id, result),
-            DriverEvent::RequestCancelled(id) => self.cancel_request(id),
+            DriverEvent::HostMessage(message) => self.handle_host_message(message).await,
+            DriverEvent::DelegateCompleted { id, result } => {
+                self.complete_delegate(id, result).await
+            }
+            DriverEvent::RequestCancelled(id) => self.cancel_request(id).await,
             DriverEvent::Failed(reason) => {
                 self.fail(reason);
                 false
             }
         };
         if keep_running {
-            self.flush_deferred_waits()
+            self.flush_deferred_waits().await
         } else {
             false
         }
     }
 
-    fn queue_frame(&mut self, frame: EncodedFrame) -> bool {
-        match self.outgoing_tx.try_send(frame) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.fail("code-mode host outgoing queue is full".to_string());
+    async fn queue_frame(&mut self, frame: EncodedFrame) -> bool {
+        let sender = self.outgoing_tx.clone();
+        let cancellation = self.cancellation.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                self.fail("code-mode host connection closed".to_string());
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.fail("code-mode host writer closed".to_string());
-                false
+            result = sender.send(frame) => match result {
+                Ok(()) => true,
+                Err(_) => {
+                    self.fail("code-mode host writer closed".to_string());
+                    false
+                }
             }
         }
     }
